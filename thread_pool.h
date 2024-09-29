@@ -9,6 +9,7 @@
 #include <utility>
 #include <memory>
 #include <optional>
+#include <future>
 
 // We need a queue that supports multi-thread SAFE push and pop
 template<typename T>
@@ -24,9 +25,9 @@ public:
     }
 
     std::optional<T> pop() {
-        std::lock_guard(this->mtx_);
+        std::lock_guard lock(this->mtx_);
         if (q_.empty()) return std::nullopt;
-        t = q_.front();
+        auto t = q_.front();
         q_.pop();
         return t;
     }
@@ -58,7 +59,7 @@ private:
             while (!pool_ptr_->killed_) {
                 // wait for pool to wake the thread up
                 std::unique_lock<std::mutex> lock(pool_ptr_->mtx_);
-                pool_ptr_->cv.wait(lock);
+                pool_ptr_->cv_.wait(lock);
                 const auto t = pool_ptr_->q_.pop();
                 if (!t.has_value()) continue;
                 t.value()();
@@ -78,15 +79,26 @@ public:
         }
     }
 
+    // We need typename to explicitly state the following part is a type
+    // invoke_result takes TYPE as a param, not variable
     template<typename F, typename... Arg>
-    auto submit(F f, Arg... args) {
-        
+    auto submit(F f, Arg... args) -> std::future<typename std::invoke_result<F, Arg...>::type> {
+        using return_type = std::invoke_result<F, Arg...>::type;
+        // We need to get the answer back, thus need a future ==> std::packaged_task
+        auto func = std::bind(std::forward<F>(f), std::forward<Arg...>(args...));
+        auto ptr = std::make_shared<std::packaged_task<return_type()>>(func);
+        // We need to encapsulate it into a std::function, so as to push into the task queue
+        std::function<void()> f_to_push = [ptr]() { (*ptr)(); };
+        std::lock_guard lock(this->mtx_);
+        q_.push(std::move(f_to_push));
+        this->cv_.notify_one();
+        return ptr->get_future();
     }
 
 private:
     std::vector<std::thread> thd_vc_;
     std::mutex mtx_;                    // control the visit of private var
-    std::condition_variable cv;
+    std::condition_variable cv_;
     bool killed_;
     Queue<std::function<void()>> q_;
     
