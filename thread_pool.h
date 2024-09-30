@@ -23,38 +23,37 @@
 template<typename T>
 class Queue {
 private:
-    std::mutex mtx_;
+    std::mutex mtx_;    // We need the lock to avoid push and pop simultaneously
     std::queue<T> q_;
 
 public:
     void push(T& t) {
-        std::lock_guard lock(this->mtx_);
+        std::lock_guard<std::mutex> lock(this->mtx_);
         q_.push(t);
     }
 
     std::optional<T> pop() {
-        std::lock_guard lock(this->mtx_);
+        std::lock_guard<std::mutex> lock(this->mtx_);
         if (q_.empty()) return std::nullopt;
         auto t = q_.front();
         q_.pop();
         return t;
     }
 
-    auto size() const {
+    auto size() {
+        std::lock_guard<std::mutex> lock(this->mtx_);
         return q_.size();
     }
 
-    bool empty() const {
+    bool empty() {
         return 0 == this->size();
     }
 
 };
 
-// We need a task that keeps running until the pool is killed
-
-// ? How to dispatch work to worker
 class thread_pool {
 private:
+    // We need a task that keeps running until the pool is killed
     class worker {
     private:
         const int id_;
@@ -67,15 +66,18 @@ private:
 
         void operator()() {
             // TODO: thread is likely to be blocked 
-            while (!pool_ptr_->killed_) {
+            while (!pool_ptr_->killed_ || !pool_ptr_->q_.empty()) {
                 // wait for pool to wake the thread up
                 std::optional<std::function<void()>> func;
                 // RAII style lock management
+                // We just need the lock to get the front
                 {
-                std::unique_lock<std::mutex> lock(pool_ptr_->mtx_);
-                pool_ptr_->cv_.wait(lock);
-                func = pool_ptr_->q_.pop();
-                LOG("[WORKER %d]: Pop a func from queue", this->id_);
+                    // std::unique_lock<std::mutex> lock(pool_ptr_->mtx_);
+                    // ensure that all thread can end (for those not blocked by condition variable)
+                    if (pool_ptr_->killed_) return;     
+                    // pool_ptr_->cv_.wait(lock);
+                    func = pool_ptr_->q_.pop();
+                    LOG("[WORKER %d]: Pop a func from queue", this->id_);
                 }
                 if (!func.has_value()) {
                     LOG("[WORKER %d]: func is nullopt", this->id_);
@@ -88,13 +90,6 @@ private:
 
     };
 
-public:
-    explicit thread_pool(int n) : thd_vc_(n), killed_(false) {
-        init();
-        LOG("[THREAD_POOL]: Finish constructing threads");
-    };
-    ~thread_pool() = default;
-
     // launch the threads and ensure running until killed
     void init() {
         int n = thd_vc_.size();
@@ -102,6 +97,13 @@ public:
             thd_vc_[i] = std::thread(worker(i, this));
         }
     }
+
+public:
+    explicit thread_pool(int n) : thd_vc_(n), killed_(false) {
+        init();
+        LOG("[THREAD_POOL]: Finish constructing threads");
+    };
+    ~thread_pool() = default;
 
     // We need typename to explicitly state the following part is a type
     // invoke_result takes TYPE as a param, not variable
@@ -115,14 +117,17 @@ public:
         std::function<void()> f_to_push = [ptr]() { (*ptr)(); };
         q_.push(f_to_push);
         LOG("[SUBMIT]: Success");
-        this->cv_.notify_one();
+        // this->cv_.notify_one();
         LOG("[CV]: Call notify one");
         return ptr->get_future();
     }
 
     void end() {
-        killed_ = true;
-        this->cv_.notify_all();
+        {
+            std::lock_guard lock(this->mtx_);
+            killed_ = true;
+            // this->cv_.notify_all();
+        }
         for (auto& t : thd_vc_) {
             if (t.joinable()) {
                 t.join();
